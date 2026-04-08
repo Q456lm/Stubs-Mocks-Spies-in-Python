@@ -136,3 +136,142 @@ class TestFraudAwareProcessor(unittest.TestCase):
         tx = self._make_tx(amount = 999, tx_id="TX1", user_id=67)
         self.proc.process(tx)
         self.mailer.send_receipt.assert_called_once_with(67, "TX1", 999)
+
+class TestStatementBuilder(unittest.TestCase):
+    def setUp(self):
+        self.repo    = MagicMock()
+        self.builder = StatementBuilder(self.repo)
+    
+    def test_no_transactions(self):
+        self.repo.find_by_user.return_value = []
+        result = self.builder.build(user_id=1)
+
+        self.assertEqual(result["count"], 0)
+        self.assertEqual(result["total_charged"], 0.0)
+        self.assertIsInstance(result["transactions"], list)
+
+    def test_success_transaction(self):
+        self.repo.find_by_user.return_value = [
+            Transaction("Test 1", 7, 10.00, status="success"),
+            Transaction("Test 2", 7,  50.00, status="declined"), 
+            Transaction("Test 3", 7, 25.00, status="success"),
+            Transaction("Test 4", 7,  75.00, status="pending"), 
+        ]
+
+        result = self.builder.build(user_id=10)
+        self.assertEqual(result["total_charged"], 35.00)
+        self.assertEqual(result["count"], 4)   
+
+    def test_mixed_transactions(self):
+        self.repo.find_by_user.return_value = [
+            Transaction("Test 1", 3, 5.00, status="success"),
+            Transaction("Test 2", 3,  5.00, status="success"), 
+            Transaction("Test 3", 3, 5.00, status="success"),
+            Transaction("Test 4", 3,  5.00, status="success"), 
+        ]
+
+        result = self.builder.build(user_id=3)
+        self.assertEqual(result["total_charged"], 20.00)
+        self.assertEqual(result["count"], 4) 
+    
+    def test_rounding(self):
+        self.repo.find_by_user.return_value = [
+            Transaction("Test 1", 3, 5.0067, status="success"),
+            Transaction("Test 2", 3,  5.0094, status="success"), 
+        ]
+
+        result = self.builder.build(user_id=3)
+        self.assertEqual(result["total_charged"], 10.02)
+        self.assertEqual(result["count"], 2) 
+
+    def test_transaction_return(self):
+        return1 = [
+            Transaction("Test 1", 3, 5.0067, status="success"),
+            Transaction("Test 2", 3,  5.0094, status="success"), 
+        ]
+        self.repo.find_by_user.return_value = return1
+
+        result = self.builder.build(user_id=3)
+
+        self.assertEqual(result["transactions"],return1)
+    
+class TestCheckoutServiceWithSpy(unittest.TestCase):
+    def setUp(self):
+        self.calculator      = FeeCalculator()
+        self.spy_calc  = MagicMock(wraps=self.calculator)
+        self.gateway   = MagicMock()
+        self.gateway.charge.return_value = True
+        self.service       = CheckoutService(self.spy_calc, self.gateway)
+
+    def _usd_tx(self, amount=100.00):
+        return Transaction("TX-USD", 1, amount, currency="USD")
+
+    def _eur_tx(self, amount=200.00):
+        return Transaction("TX-EUR", 1, amount, currency="EUR")
+
+    
+    def test_correct_usd(self):
+        result = self.calculator.processing_fee(100);
+        self.assertEqual(result,3.20)
+
+    def test_correct_international(self):
+        result = self.calculator.processing_fee(200,"EUR")
+        self.assertEqual(result,9.10)
+
+    def test_correct_processing_args(self):
+        tx = self._usd_tx(250.00)
+        self.service.checkout(tx)
+
+        self.spy_calc.processing_fee.assert_called_once_with(250.00, "USD")
+
+    def test_correct_net_args(self):
+        tx = self._usd_tx(250.00)
+        self.service.checkout(tx)
+
+        self.spy_calc.net_amount.assert_called_once_with(250.00, "USD")
+    
+    def test_called_exactly_once(self):
+        self.service.checkout(self._usd_tx(500.00))
+
+        self.assertEqual(self.spy_calc.processing_fee.call_count, 1)
+        self.assertEqual(self.spy_calc.net_amount.call_count, 1)
+
+    def test_receipt_flow(self):
+        receipt = self.service.checkout(self._usd_tx(100.00))
+
+        self.assertEqual(receipt["fee"], 3.2)
+        self.assertEqual(receipt["net"], 96.8)
+
+    def test_only_net_amount(self):
+        calculator = FeeCalculator()
+        service = CheckoutService(calculator, self.gateway)
+        tx = self._usd_tx(500.00)
+
+        with patch.object(calculator, "net_amount", wraps=calculator.net_amount) as spy_net:
+            receipt = service.checkout(tx)
+        
+        spy_net.assert_called_once_with(500.00, "USD")
+        self.assertEqual(receipt["net"], 485.20)
+
+    def test_contrast(self):
+        mock_calc = MagicMock()
+        mock_calc.processing_fee.return_value = 5.00
+        mock_calc.net_amount.return_value     = 95.00 
+
+        service = CheckoutService(mock_calc, self.gateway)
+        receipt = service.checkout(self._usd_tx(100.00))
+
+        self.assertEqual(receipt["fee"],    5.00)
+        self.assertEqual(receipt["net"],   95.00)
+        self.assertEqual(receipt["status"], "success")
+        mock_calc.processing_fee.assert_called_once()
+
+
+
+
+
+
+
+
+
+
